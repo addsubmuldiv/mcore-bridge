@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
+from importlib import metadata
 import megatron.core
 import torch
 import torch.nn as nn
@@ -30,6 +31,49 @@ from .utils import tuners_sharded_state_dict
 
 mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
+MINDSPEED_015 = version.parse('0.15.0')
+
+
+def _get_mindspeed_version():
+    try:
+        return version.parse(metadata.version('mindspeed'))
+    except metadata.PackageNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _use_legacy_npu_local_linear() -> bool:
+    if not is_torch_npu_available():
+        return False
+    mindspeed_version = _get_mindspeed_version()
+    if mindspeed_version is None:
+        # 版本未知时优先保守处理，避免把旧 NPU 栈强切到 0.15 的 TE 语义。
+        return True
+    return mindspeed_version < MINDSPEED_015
+
+
+def _build_local_te_linear(input_size: int, output_size: int, bias: bool, **kwargs):
+    if _use_legacy_npu_local_linear():
+        return nn.Linear(
+            in_features=input_size,
+            out_features=output_size,
+            bias=bias,
+        )
+    local_kwargs = dict(kwargs)
+    parallel_mode = None
+    if is_torch_npu_available():
+        # MindSpeed 0.15.x 的本地 TE 线性层使用 duplicated 语义，且这条路径不接受 tp_group。
+        local_kwargs.pop('tp_group', None)
+        parallel_mode = 'duplicated'
+    return TELinear(
+        input_size=input_size,
+        output_size=output_size,
+        bias=bias,
+        parallel_mode=parallel_mode,
+        skip_weight_param_allocation=False,
+        **local_kwargs,
+    )
 
 
 class LoraParallelLinear(MegatronModule, LoraLayer):
@@ -105,22 +149,8 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
             kwargs['tp_group'] = self.base_layer.tp_group
         if isinstance(self.base_layer, TopKRouter):
             router_shape = self.base_layer.weight.shape
-            lora_a = TELinear(
-                input_size=router_shape[1],
-                output_size=r,
-                bias=lora_bias,
-                parallel_mode=None,
-                skip_weight_param_allocation=False,
-                **kwargs,
-            )
-            lora_b = TELinear(
-                input_size=r,
-                output_size=router_shape[0],
-                bias=lora_bias,
-                parallel_mode=None,
-                skip_weight_param_allocation=False,
-                **kwargs,
-            )
+            lora_a = _build_local_te_linear(router_shape[1], r, lora_bias, **kwargs)
+            lora_b = _build_local_te_linear(r, router_shape[0], lora_bias, **kwargs)
         elif self.is_parallel_a:
             in_features = self.in_features * self.tp_size
             if self.is_grouped:
@@ -147,14 +177,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     input_is_parallel=True,
                     **kwargs,
                 )
-                lora_b = TELinear(
-                    input_size=r,
-                    output_size=self.out_features,
-                    bias=lora_bias,
-                    parallel_mode=None,
-                    skip_weight_param_allocation=False,
-                    **kwargs,
-                )
+                lora_b = _build_local_te_linear(r, self.out_features, lora_bias, **kwargs)
                 lora_a.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
         else:
             if is_torch_npu_available():
@@ -177,20 +200,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     **kwargs,
                 )
             else:
-                if is_torch_npu_available():
-                    lora_a = nn.Linear(
-                        in_features=self.in_features,
-                        out_features=r,
-                        bias=lora_bias,
-                    )
-                else:
-                    lora_a = TELinear(
-                        input_size=self.in_features,
-                        output_size=r,
-                        bias=lora_bias,
-                        parallel_mode=None,
-                        skip_weight_param_allocation=False,
-                        **kwargs)
+                lora_a = _build_local_te_linear(self.in_features, r, lora_bias, **kwargs)
                 lora_b = TEColumnParallelLinear(
                     input_size=r,
                     output_size=out_features,
