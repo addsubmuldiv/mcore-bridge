@@ -595,8 +595,10 @@ def _patch_TELinear():
 
     def __repr__(self):
         if is_torch_npu_available():
-            # MindSpeed 0.15.x 的 TE 层把部分调试字段改成了 input_size/output_size，
-            # 这里只在 NPU 路径做兼容，避免影响 GPU/旧版本的原始字段语义。
+            # MindSpeed 0.15.x changes some TE debug fields to
+            # input_size/output_size. Keep this compatibility on the NPU path
+            # only so GPU and older versions retain their original field
+            # semantics.
             in_features = getattr(self, 'in_features', getattr(self, 'input_size', None))
             out_features = getattr(self, 'out_features', getattr(self, 'output_size', None))
             use_bias = getattr(self, 'use_bias', getattr(self, 'bias', None) is not None)

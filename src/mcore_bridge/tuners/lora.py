@@ -48,7 +48,8 @@ def _use_legacy_npu_local_linear() -> bool:
         return False
     mindspeed_version = _get_mindspeed_version()
     if mindspeed_version is None:
-        # 版本未知时优先保守处理，避免把旧 NPU 栈强切到 0.15 的 TE 语义。
+        # Fall back to the conservative path when the version is unknown so we
+        # do not force an older NPU stack onto the 0.15 TE semantics.
         return True
     return mindspeed_version < MINDSPEED_015
 
@@ -63,7 +64,8 @@ def _build_local_te_linear(input_size: int, output_size: int, bias: bool, **kwar
     local_kwargs = dict(kwargs)
     parallel_mode = None
     if is_torch_npu_available():
-        # MindSpeed 0.15.x 的本地 TE 线性层使用 duplicated 语义，且这条路径不接受 tp_group。
+        # Local TE linear layers in MindSpeed 0.15.x use duplicated semantics,
+        # and this path does not accept tp_group.
         local_kwargs.pop('tp_group', None)
         parallel_mode = 'duplicated'
     return TELinear(
