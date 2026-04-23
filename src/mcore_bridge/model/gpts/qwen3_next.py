@@ -59,7 +59,7 @@ except ImportError:
 logger = get_logger()
 
 
-def resolve_hf_attention_mask(kwargs) -> Optional[torch.Tensor]:
+def resolve_gdn_attention_mask(kwargs) -> Optional[torch.Tensor]:
     if is_torch_npu_available():
         attention_mask = kwargs.get('attention_mask_2d')
         if attention_mask is not None:
