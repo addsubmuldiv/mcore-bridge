@@ -67,9 +67,7 @@ def resolve_gdn_attention_mask(kwargs) -> Optional[torch.Tensor]:
     attention_mask = kwargs.get('attention_mask')
     if attention_mask is None:
         return None
-    if attention_mask.ndim == 4:
-        return (~attention_mask).sum(dim=(1, 2)) > 0
-    return attention_mask.to(torch.bool)
+    return (~attention_mask).sum(dim=(1, 2)) > 0
 
 
 class Qwen3NextRMSNorm(torch.nn.Module):
