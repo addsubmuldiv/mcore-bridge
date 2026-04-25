@@ -1571,8 +1571,10 @@ class GPTBridge:
             self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict, 'input_layernorm.weight', to_mcore)
         else:
             hf_state_dict.update(self._set_attn_state(mg_attn, hf_state_dict, 'self_attn.', layer_idx, to_mcore))
-            self._set_state_dict(mg_layer, 'self_attention.linear_qkv.layer_norm_weight', hf_state_dict,
-                                 'input_layernorm.weight', to_mcore)
+            input_layernorm_key = ('input_layernorm.weight'
+                                   if getattr(self.config, 'transformer_impl', 'transformer_engine') == 'local' else
+                                   'self_attention.linear_qkv.layer_norm_weight')
+            self._set_state_dict(mg_layer, input_layernorm_key, hf_state_dict, 'input_layernorm.weight', to_mcore)
         return hf_state_dict
 
     def _set_layer_mlp(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool, is_mtp: bool = False):
@@ -1591,7 +1593,10 @@ class GPTBridge:
         else:
             hf_state_dict.update(
                 self._set_mlp_state(mg_mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', layer_idx, to_mcore))
-            self._set_state_dict(mg_layer, 'mlp.linear_fc1.layer_norm_weight', hf_state_dict,
+            post_attention_layernorm_key = ('pre_mlp_layernorm.weight'
+                                            if getattr(self.config, 'transformer_impl', 'transformer_engine') == 'local' else
+                                            'mlp.linear_fc1.layer_norm_weight')
+            self._set_state_dict(mg_layer, post_attention_layernorm_key, hf_state_dict,
                                  'post_attention_layernorm.weight', to_mcore)
         return hf_state_dict
 

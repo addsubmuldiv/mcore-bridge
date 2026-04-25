@@ -5,10 +5,12 @@ from copy import deepcopy
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, _get_extra_te_kwargs
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (get_gpt_layer_local_spec,
+                                                      get_gpt_layer_with_transformer_engine_spec)
 from megatron.core.models.huggingface import HuggingFaceModule as _HuggingFaceModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_tensor_model_parallel_rank
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel import (all_gather_last_dim_from_tensor_parallel_region,
                                            gather_from_sequence_parallel_region,
                                            reduce_scatter_to_sequence_parallel_region)
@@ -552,20 +554,32 @@ class Qwen3NextLoader(ModelLoader):
         # Use Zero-Centered RMSNorm to match HuggingFace exactly (no +1/-1 conversion needed)
         layer_norm_impl = Qwen3NextRMSNorm
         kwargs = {'use_kitchen': config.use_kitchen} if mcore_013 else {}
-        moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=config.num_moe_experts,
-            moe_grouped_gemm=config.moe_grouped_gemm,
-            qk_layernorm=config.qk_layernorm,
-            multi_latent_attention=config.multi_latent_attention,
-            **kwargs,
-        )
+        if self.use_transformer_engine:
+            linear_cls = TEColumnParallelLinear
+            moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=config.num_moe_experts,
+                moe_grouped_gemm=config.moe_grouped_gemm,
+                qk_layernorm=config.qk_layernorm,
+                multi_latent_attention=config.multi_latent_attention,
+                **kwargs,
+            )
+        else:
+            linear_cls = ColumnParallelLinear
+            moe_layer_spec = get_gpt_layer_local_spec(
+                num_experts=config.num_moe_experts,
+                moe_grouped_gemm=config.moe_grouped_gemm,
+                qk_layernorm=config.qk_layernorm,
+                multi_latent_attention=config.multi_latent_attention,
+                normalization=config.normalization,
+                **kwargs,
+            )
         layer_specs = []
         for is_linear_attention in self.config.linear_attention_freq:
             layer_spec = deepcopy(moe_layer_spec)
             if is_linear_attention:
                 layer_spec.submodules.self_attention.module = self.gated_delta_net
             else:
-                layer_spec.submodules.self_attention.submodules.linear_qkv = TEColumnParallelLinear
+                layer_spec.submodules.self_attention.submodules.linear_qkv = linear_cls
                 layer_spec.submodules.self_attention.module = Qwen3NextSelfAttention
             # Replace ALL layernorms with Qwen3NextRMSNorm (Zero-Centered)
             layer_spec.submodules.input_layernorm = layer_norm_impl
@@ -573,7 +587,7 @@ class Qwen3NextLoader(ModelLoader):
                 layer_spec.submodules.pre_mlp_layernorm = layer_norm_impl
             # qwen3.5 dense
             if config.hf_model_type == 'qwen3_5':
-                layer_spec.submodules.mlp.submodules.linear_fc1 = TEColumnParallelLinear
+                layer_spec.submodules.mlp.submodules.linear_fc1 = linear_cls
             # Replace qk_layernorm if present
             if hasattr(layer_spec.submodules.self_attention.submodules, 'q_layernorm'):
                 layer_spec.submodules.self_attention.submodules.q_layernorm = layer_norm_impl

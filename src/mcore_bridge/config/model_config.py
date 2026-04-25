@@ -3,7 +3,7 @@ import copy
 import os
 import re
 import torch.nn.functional as F
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass, fields
 from megatron.core import mpu
 from megatron.core.transformer import TransformerConfig
 from transformers import PretrainedConfig
@@ -112,8 +112,24 @@ def tuple_type(x):
     return tuple(int(i) for i in x.strip('()').split(','))
 
 
-@dataclass
+@dataclass(init=False, repr=False, eq=False)
 class ModelConfig(TransformerConfig):
+    def __init__(self, **kwargs):
+        for f in fields(self):
+            if f.name in kwargs:
+                value = kwargs.pop(f.name)
+            elif f.default is not MISSING:
+                value = copy.deepcopy(f.default)
+            elif f.default_factory is not MISSING:
+                value = f.default_factory()
+            else:
+                continue
+            setattr(self, f.name, value)
+        if kwargs:
+            unknown = ', '.join(sorted(kwargs))
+            raise TypeError(f'Unexpected ModelConfig arguments: {unknown}')
+        self.__post_init__()
+
     mcore_model_type: Optional[str] = None  # Inferred from hf_model_type by default
     hf_model_type: Optional[str] = None
     llm_model_type: Optional[str] = None
