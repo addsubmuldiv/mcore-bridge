@@ -230,11 +230,18 @@ class ModelConfig(TransformerConfig):
 
     # Override
     perform_initialization: bool = False
+    transformer_impl: Literal['local', 'transformer_engine'] = 'transformer_engine'
     apply_query_key_layer_scaling: Optional[bool] = None
     moe_router_dtype: Literal['none', 'fp32', 'fp64'] = 'fp32'
     moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = 'alltoall'
     moe_grouped_gemm: bool = True
     variable_seq_lengths: bool = True
+
+    # MindSpeed Ascend COC
+    use_ascend_coc: bool = False
+    coc_mode: int = -1
+    coc_parallel_num: int = 1
+    coc_fused_kernel: bool = False
 
     overlap_p2p_comm: bool = True
     persist_layer_norm: bool = True
