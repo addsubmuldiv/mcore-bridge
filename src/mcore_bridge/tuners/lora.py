@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import copy
 import math
 import megatron.core
 import peft
@@ -10,11 +11,12 @@ from contextlib import contextmanager, nullcontext
 from importlib import metadata
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.extensions.transformer_engine import (TEColumnParallelGroupedLinear, TEColumnParallelLinear,
+from megatron.core.extensions.transformer_engine import (HAVE_TE, TEColumnParallelGroupedLinear, TEColumnParallelLinear,
                                                          TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear,
                                                          TERowParallelGroupedLinear, TERowParallelLinear)
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.parallel_state import get_expert_tensor_parallel_world_size, get_tensor_model_parallel_world_size
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
@@ -56,7 +58,7 @@ def _use_legacy_npu_local_linear() -> bool:
 
 
 def _build_local_te_linear(input_size: int, output_size: int, bias: bool, **kwargs):
-    if _use_legacy_npu_local_linear():
+    if not HAVE_TE or _use_legacy_npu_local_linear():
         return nn.Linear(
             in_features=input_size,
             out_features=output_size,
@@ -115,7 +117,8 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         if use_dora:
             raise ValueError(f'{self.__class__.__name__} does not support DoRA yet, please set it to False')
 
-        self.is_parallel_a = isinstance(base_layer, (TERowParallelLinear, TERowParallelGroupedLinear))
+        self.is_parallel_a = isinstance(base_layer, (TERowParallelLinear, TERowParallelGroupedLinear,
+                                                     RowParallelLinear))
         self.is_grouped = isinstance(base_layer, TEGroupedLinear)
         self.fan_in_fan_out = fan_in_fan_out
         self._active_adapter = adapter_name
@@ -164,10 +167,12 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         self.lora_dropout[adapter_name] = lora_dropout_layer
 
         # lora needs to be forced to upgrade to 32-bit precision, otherwise it will overflow
+        adapter_config = copy.copy(self.config)
+        adapter_config.gradient_accumulation_fusion = False
         kwargs = {
             'skip_bias_add': False,
-            'init_method': self.config.init_method,
-            'config': self.config,
+            'init_method': adapter_config.init_method,
+            'config': adapter_config,
             'is_expert': self.is_expert,
         }
         if not (mcore_016 and self.is_grouped):
@@ -197,15 +202,29 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     **kwargs,
                 )
             else:
-                lora_a = TERowParallelLinear(
-                    input_size=in_features,
-                    output_size=r,
-                    bias=False,
-                    input_is_parallel=True,
-                    **kwargs,
-                )
-                lora_b = _build_local_te_linear(r, self.out_features, lora_bias, **kwargs)
-                lora_a.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
+                if isinstance(self.base_layer, RowParallelLinear):
+                    lora_a_kwargs = dict(kwargs)
+                    lora_a_kwargs['skip_bias_add'] = True
+                    lora_a = RowParallelLinear(
+                        input_size=self.in_features,
+                        output_size=r,
+                        bias=False,
+                        input_is_parallel=self.base_layer.input_is_parallel,
+                        **lora_a_kwargs,
+                    )
+                    lora_b = nn.Linear(in_features=r, out_features=self.out_features, bias=lora_bias,
+                                       dtype=torch.float32)
+                else:
+                    lora_a = TERowParallelLinear(
+                        input_size=in_features,
+                        output_size=r,
+                        bias=False,
+                        input_is_parallel=True,
+                        **kwargs,
+                    )
+                    lora_b = _build_local_te_linear(r, self.out_features, lora_bias, **kwargs)
+                if hasattr(self.base_layer, 'parallel_mode'):
+                    lora_a.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
         else:
             if is_torch_npu_available():
                 out_features = self.out_features
@@ -227,24 +246,40 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     **kwargs,
                 )
             else:
-                lora_a = _build_local_te_linear(self.in_features, r, lora_bias, **kwargs)
-                lora_b = TEColumnParallelLinear(
-                    input_size=r,
-                    output_size=out_features,
-                    bias=lora_bias,
-                    gather_output=False,
-                    **kwargs,
-                )
-                lora_b.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
+                if isinstance(self.base_layer, ColumnParallelLinear):
+                    lora_a = nn.Linear(in_features=self.in_features, out_features=r, bias=lora_bias,
+                                       dtype=torch.float32)
+                    lora_b = ColumnParallelLinear(
+                        input_size=r,
+                        output_size=self.out_features,
+                        bias=lora_bias,
+                        gather_output=self.base_layer.gather_output,
+                        **kwargs,
+                    )
+                else:
+                    lora_a = _build_local_te_linear(self.in_features, r, lora_bias, **kwargs)
+                    lora_b = TEColumnParallelLinear(
+                        input_size=r,
+                        output_size=out_features,
+                        bias=lora_bias,
+                        gather_output=False,
+                        **kwargs,
+                    )
+                    lora_b.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
         for lora in [lora_a, lora_b]:
+            if isinstance(lora, (ColumnParallelLinear, RowParallelLinear)):
+                # LoRA adapter params are not allocated in Megatron's main grad
+                # buffer, so the fused path cannot assume weight.main_grad exists.
+                lora.gradient_accumulation_fusion = False
             # When parallel_mode is set to None by moe_shared_expert_overlap,
             # disable UB comm overlap; the corresponding collectives are driven
             # externally by the framework.
-            if isinstance(lora, (TERowParallelLinear, TEColumnParallelLinear)) and lora.parallel_mode is None:
-                lora.ub_overlap_rs_fprop = False
-                lora.ub_overlap_ag_dgrad = False
-                lora.ub_overlap_ag_fprop = False
-                lora.ub_overlap_rs_dgrad = False
+            if isinstance(lora, (TERowParallelLinear, TEColumnParallelLinear)) and getattr(
+                    lora, 'parallel_mode', None) is None:
+                for attr in ['ub_overlap_rs_fprop', 'ub_overlap_ag_dgrad', 'ub_overlap_ag_fprop',
+                             'ub_overlap_rs_dgrad']:
+                    if hasattr(lora, attr):
+                        setattr(lora, attr, False)
 
         self.lora_A[adapter_name] = lora_a
         self.lora_B[adapter_name] = lora_b
@@ -379,7 +414,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                                            f'Got base_layer type: {type(self.base_layer)}. ')
                 else:
                     (result, x), bias = self.base_layer(x, *args, **kwargs)
-        elif isinstance(self.base_layer, (TELinear, TEGroupedLinear)):
+        elif isinstance(self.base_layer, (TELinear, TEGroupedLinear, ColumnParallelLinear, RowParallelLinear)):
             result, bias = self.base_layer(x, *args, **kwargs)
         elif isinstance(self.base_layer, TopKRouter):
             with self._patch_router_gating():

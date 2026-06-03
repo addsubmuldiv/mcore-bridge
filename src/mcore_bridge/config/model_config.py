@@ -119,6 +119,7 @@ class ModelConfig(TransformerConfig):
     llm_model_type: Optional[str] = None
     padded_vocab_size: Optional[int] = None
     rope_scaling: Optional[Union[dict, str]] = None
+    rope_type: Optional[str] = None
     attention_scaling: float = 1.
 
     # model
@@ -299,6 +300,7 @@ class ModelConfig(TransformerConfig):
             self.rope_scaling = json_parse_to_dict(self.rope_scaling)
             if 'type' in self.rope_scaling and 'rope_type' not in self.rope_scaling:
                 self.rope_scaling['rope_type'] = self.rope_scaling['type']
+            self.rope_type = self.rope_scaling.get('rope_type')
 
         if self.add_bias_linear:
             self.add_qkv_bias = True
