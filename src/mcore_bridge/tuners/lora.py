@@ -76,6 +76,29 @@ def _build_local_te_linear(input_size: int, output_size: int, bias: bool, **kwar
     )
 
 
+def _with_lora_input_size(kwargs, input_size: int):
+    local_kwargs = dict(kwargs)
+    local_config = copy.copy(local_kwargs['config'])
+    local_config.hidden_size = input_size
+    local_kwargs['config'] = local_config
+    return local_kwargs
+
+
+def _base_outputs_full_tensor(base_layer, out_features: int, tp_size: int) -> bool:
+    if tp_size <= 1:
+        return False
+    output_size_per_partition = getattr(base_layer, 'output_size_per_partition', None)
+    if output_size_per_partition is not None:
+        return output_size_per_partition == out_features
+    weight = getattr(base_layer, 'weight', None)
+    return weight is not None and weight.shape[0] == out_features
+
+
+def _inherit_explicit_expert_comm(lora_layer, base_layer) -> None:
+    if hasattr(lora_layer, 'explicit_expert_comm') and hasattr(base_layer, 'explicit_expert_comm'):
+        lora_layer.explicit_expert_comm = base_layer.explicit_expert_comm
+
+
 def _get_tensor_parallel_group_for_lora(base_layer):
     """Resolve the tensor-parallel group across TE and MindSpeed TE variants.
 
@@ -191,7 +214,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     input_size=in_features,
                     output_size=r,
                     bias=False,
-                    **kwargs,
+                    **_with_lora_input_size(kwargs, in_features),
                 )
                 lora_b = TEGroupedLinear(
                     num_gemms=self.base_layer.num_gemms,
@@ -199,7 +222,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     output_size=self.out_features,
                     bias=lora_bias,
                     parallel_mode=None,
-                    **kwargs,
+                    **_with_lora_input_size(kwargs, r),
                 )
             else:
                 if isinstance(self.base_layer, RowParallelLinear):
@@ -237,13 +260,13 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     output_size=r,
                     bias=lora_bias,
                     parallel_mode=None,
-                    **kwargs)
+                    **_with_lora_input_size(kwargs, self.in_features))
                 lora_b = TEColumnParallelGroupedLinear(
                     num_gemms=self.base_layer.num_gemms,
                     input_size=r,
                     output_size=out_features,
                     bias=lora_bias,
-                    **kwargs,
+                    **_with_lora_input_size(kwargs, r),
                 )
             else:
                 if isinstance(self.base_layer, ColumnParallelLinear):
@@ -258,15 +281,21 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     )
                 else:
                     lora_a = _build_local_te_linear(self.in_features, r, lora_bias, **kwargs)
-                    lora_b = TEColumnParallelLinear(
-                        input_size=r,
-                        output_size=out_features,
-                        bias=lora_bias,
-                        gather_output=False,
-                        **kwargs,
-                    )
-                    lora_b.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
+                    if is_torch_npu_available() and _base_outputs_full_tensor(
+                            self.base_layer, self.out_features, self.tp_size):
+                        lora_b = _build_local_te_linear(r, self.out_features, lora_bias, **kwargs)
+                    else:
+                        lora_b = TEColumnParallelLinear(
+                            input_size=r,
+                            output_size=out_features,
+                            bias=lora_bias,
+                            gather_output=False,
+                            **kwargs,
+                        )
+                        if hasattr(self.base_layer, 'parallel_mode'):
+                            lora_b.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
         for lora in [lora_a, lora_b]:
+            _inherit_explicit_expert_comm(lora, self.base_layer)
             if isinstance(lora, (ColumnParallelLinear, RowParallelLinear)):
                 # LoRA adapter params are not allocated in Megatron's main grad
                 # buffer, so the fused path cannot assume weight.main_grad exists.
