@@ -30,6 +30,18 @@ except ImportError:
     _GatedDeltaNet = object
 
 
+def _naive_l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6):
+    original_dtype = x.dtype
+    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return (x * inv_norm).to(original_dtype)
+
+
+def _qk_l2norm(x: torch.Tensor):
+    if x.device.type == 'npu':
+        return _naive_l2norm(x)
+    return l2norm(x)
+
+
 # Code borrowed from NVIDIA/Megatron-LM
 def _unpack_sequence(x, cu_seqlens, dim=1):
     unpacked_x = []
@@ -299,8 +311,8 @@ class GatedDeltaNet(_GatedDeltaNet):
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            query = l2norm(query.contiguous())
-            key = l2norm(key.contiguous())
+            query = _qk_l2norm(query.contiguous())
+            key = _qk_l2norm(key.contiguous())
         if self.num_value_heads // self.num_key_heads > 1:
             query = query.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
             key = key.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)

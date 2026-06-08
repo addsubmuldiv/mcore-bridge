@@ -1,4 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import importlib
+
 import torch
 from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
 from megatron.core.models.huggingface import HuggingFaceModule as _HuggingFaceModule
@@ -20,11 +22,39 @@ except ImportError:
     _Qwen3_5MoeGatedDeltaNet = object
 
 
+def _patch_mindspeed_chunk_gated_delta_rule_l2norm():
+    module = importlib.import_module('mindspeed.core.ssm.chunk_gated_delta_rule')
+    if getattr(module, '_mcore_bridge_l2norm_patched', False):
+        return
+
+    def l2norm(x: torch.Tensor, *args, dim: int = -1, eps: float = 1e-6, output_dtype=None, **kwargs):
+        if args:
+            eps = args[0]
+        if len(args) > 1:
+            output_dtype = args[1]
+        if 'dim' in kwargs:
+            dim = kwargs.pop('dim')
+        if 'eps' in kwargs:
+            eps = kwargs.pop('eps')
+        if 'output_dtype' in kwargs:
+            output_dtype = kwargs.pop('output_dtype')
+        if kwargs:
+            raise TypeError(f'Unexpected l2norm kwargs: {sorted(kwargs)}')
+
+        x_float = x.float()
+        inv_norm = torch.rsqrt((x_float * x_float).sum(dim=dim, keepdim=True) + eps)
+        return (x_float * inv_norm).to(output_dtype if output_dtype is not None else x.dtype)
+
+    module.l2norm = l2norm
+    module._mcore_bridge_l2norm_patched = True
+
+
 class Qwen3_5MoeGatedDeltaNet(_HuggingFaceModule, _Qwen3_5MoeGatedDeltaNet):
 
     def __init__(self, config: TransformerConfig, submodules: SelfAttentionSubmodules, layer_number: int, **kwargs):
         assert config.context_parallel_size == 1, 'Qwen3_5 currently does not support context parallel.'
         assert _Qwen3_5MoeGatedDeltaNet is not object, 'please update the `transformers` version.'
+        _patch_mindspeed_chunk_gated_delta_rule_l2norm()
         _Qwen3_5MoeGatedDeltaNet.__init__(self, config, layer_number)
         self.config = config
         extra_kwargs = _get_extra_te_kwargs(config)

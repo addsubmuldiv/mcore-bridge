@@ -770,6 +770,106 @@ class GPTBridge:
         else:
             return False
 
+    @staticmethod
+    def _is_gmm_experts(mg_mlp):
+        return mg_mlp is not None and hasattr(mg_mlp, 'weight1') and hasattr(mg_mlp, 'weight2') and not hasattr(
+            mg_mlp, 'linear_fc1')
+
+    def _set_gmm_experts_state(
+        self,
+        mg_mlp,
+        hf_state_dict,
+        layer_idx: int,
+        ep_rank: int,
+        *,
+        hf_grouped: bool,
+        is_gate_up: bool,
+    ):
+        if self._peft_format:
+            return {}
+        if hf_grouped or is_gate_up:
+            raise NotImplementedError(
+                f'Grouped GEMM expert loading only supports split gate/up/down HF weights now, '
+                f'layer_idx: {layer_idx}, hf_grouped: {hf_grouped}, is_gate_up: {is_gate_up}')
+
+        num_local_experts = self.config.num_moe_experts // self.ep_size
+        start_idx = ep_rank * num_local_experts
+        gate_up_weight = torch.concat([
+            torch.stack([
+                hf_state_dict[f'{start_idx + i}.gate_proj.weight'].load(),
+                hf_state_dict[f'{start_idx + i}.up_proj.weight'].load(),
+            ],
+                        dim=0) for i in range(num_local_experts)
+        ],
+                                      dim=0)
+        down_weight = torch.concat(
+            [hf_state_dict[f'{start_idx + i}.down_proj.weight'].load() for i in range(num_local_experts)], dim=0)
+
+        gate_up_weight = self._split_tp(gate_up_weight, self._get_tp_split_dim('linear_fc1.weight'), True, False)
+        down_weight = self._split_tp(down_weight, self._get_tp_split_dim('linear_fc2.weight'), True, False)
+
+        hidden_size = self.config.hidden_size
+        gate_up_weight = gate_up_weight.view(num_local_experts, 2, gate_up_weight.shape[-2],
+                                             gate_up_weight.shape[-1])
+        gate_up_weight = gate_up_weight.reshape(num_local_experts, -1, gate_up_weight.shape[-1])
+        gate_up_weight = gate_up_weight.permute(2, 0, 1).contiguous().view(hidden_size, -1)
+
+        down_weight = down_weight.view(num_local_experts, hidden_size, -1)
+        down_weight = down_weight.transpose(1, 2).contiguous().view(-1, hidden_size)
+
+        self._set_param(mg_mlp.weight1, gate_up_weight, None)
+        self._set_param(mg_mlp.weight2, down_weight, None)
+        return {}
+
+    def _get_gmm_experts_state(
+        self,
+        mg_mlp,
+        layer_idx: int,
+        ep_rank: int,
+        *,
+        hf_grouped: bool,
+        is_gate_up: bool,
+    ):
+        if self._peft_format:
+            return {}
+        if hf_grouped or is_gate_up:
+            raise NotImplementedError(
+                f'Grouped GEMM expert export only supports split gate/up/down HF weights now, '
+                f'layer_idx: {layer_idx}, hf_grouped: {hf_grouped}, is_gate_up: {is_gate_up}')
+        if self.config.add_bias_linear:
+            raise NotImplementedError(f'Grouped GEMM expert export does not support bias now, layer_idx: {layer_idx}')
+
+        weight1 = None if mg_mlp is None else mg_mlp.weight1.data
+        weight2 = None if mg_mlp is None else mg_mlp.weight2.data
+        gate_up_weight = self._all_gather_tp(weight1, 1, True)
+        down_weight = self._all_gather_tp(weight2, 0, True)
+        gate_up_weight = self._broadcast_ep_pp(gate_up_weight, True)
+        down_weight = self._broadcast_ep_pp(down_weight, True)
+        assert gate_up_weight is not None, f'mg_key: weight1, layer_idx: {layer_idx}'
+        assert down_weight is not None, f'mg_key: weight2, layer_idx: {layer_idx}'
+
+        if self._target_device is not None:
+            gate_up_weight = gate_up_weight.to(device=self._target_device)
+            down_weight = down_weight.to(device=self._target_device)
+        if self._only_master_rank and not is_master():
+            return {}
+
+        num_local_experts = self.config.num_moe_experts // self.ep_size
+        hidden_size = self.config.hidden_size
+        gate_up_weight = gate_up_weight.view(hidden_size, num_local_experts, -1)
+        gate_up_weight = gate_up_weight.permute(1, 2, 0).contiguous()
+        gate_up_weight = gate_up_weight.view(num_local_experts, 2, -1, hidden_size)
+        down_weight = down_weight.view(num_local_experts, -1, hidden_size)
+        down_weight = down_weight.transpose(1, 2).contiguous()
+
+        hf_state_dict = {}
+        for i in range(num_local_experts):
+            hf_i = i + ep_rank * num_local_experts
+            hf_state_dict[f'{hf_i}.gate_proj.weight'] = gate_up_weight[i][0].clone()
+            hf_state_dict[f'{hf_i}.up_proj.weight'] = gate_up_weight[i][1].clone()
+            hf_state_dict[f'{hf_i}.down_proj.weight'] = down_weight[i].clone()
+        return hf_state_dict
+
     def _set_mlp_state(
         self,
         mg_mlp,
@@ -803,6 +903,31 @@ class GPTBridge:
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
         elif not to_mcore:
             hf_state_dict = {}
+
+        is_gmm_experts = self._is_gmm_experts(mg_mlp)
+        if not to_mcore and is_expert and self.ep_pp_size > 1:
+            is_gmm_experts_tensor = torch.tensor([is_gmm_experts], dtype=torch.bool, device='cuda')
+            dist.all_reduce(is_gmm_experts_tensor, group=self.ep_pp_group)
+            is_gmm_experts = is_gmm_experts_tensor.item()
+        if is_expert and is_gmm_experts:
+            if to_mcore:
+                return self._set_gmm_experts_state(
+                    mg_mlp,
+                    hf_state_dict,
+                    layer_idx,
+                    ep_rank,
+                    hf_grouped=hf_grouped,
+                    is_gate_up=is_gate_up,
+                )
+            hf_state_dict.update(
+                self._get_gmm_experts_state(
+                    mg_mlp,
+                    layer_idx,
+                    ep_rank,
+                    hf_grouped=hf_grouped,
+                    is_gate_up=is_gate_up,
+                ))
+            return self._add_prefix(hf_state_dict, hf_prefix)
 
         # linear_fc1
         if to_mcore:
@@ -1604,8 +1729,10 @@ class GPTBridge:
         else:
             hf_state_dict.update(
                 self._set_attn_state(mg_attn, hf_state_dict, f'{self.hf_attn_prefix}.', layer_idx, to_mcore))
-            self._set_state_dict(mg_layer, 'self_attention.linear_qkv.layer_norm_weight', hf_state_dict,
-                                 self.hf_input_layernorm_key, to_mcore)
+            input_layernorm_key = ('input_layernorm.weight'
+                                   if self.config.transformer_impl == 'local' else
+                                   'self_attention.linear_qkv.layer_norm_weight')
+            self._set_state_dict(mg_layer, input_layernorm_key, hf_state_dict, self.hf_input_layernorm_key, to_mcore)
         return hf_state_dict
 
     def _set_layer_mlp(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool, is_mtp: bool = False):
@@ -1624,7 +1751,10 @@ class GPTBridge:
         else:
             hf_state_dict.update(
                 self._set_mlp_state(mg_mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', layer_idx, to_mcore))
-            self._set_state_dict(mg_layer, 'mlp.linear_fc1.layer_norm_weight', hf_state_dict,
+            pre_mlp_layernorm_key = ('pre_mlp_layernorm.weight'
+                                     if self.config.transformer_impl == 'local' else
+                                     'mlp.linear_fc1.layer_norm_weight')
+            self._set_state_dict(mg_layer, pre_mlp_layernorm_key, hf_state_dict,
                                  self.hf_post_attention_layernorm_key, to_mcore)
         return hf_state_dict
 
