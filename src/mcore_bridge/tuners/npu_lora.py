@@ -2,8 +2,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from megatron.core import parallel_state
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from megatron.core.utils import make_sharded_tensor_for_checkpoint
 from megatron.core.extensions.transformer_engine import TEGroupedLinear
 from transformers.utils import is_torch_npu_available
+from typing import Optional, Tuple
 
 from mcore_bridge.utils import get_current_device
 
@@ -54,12 +58,14 @@ def is_expert_layer(base_layer) -> bool:
 class NpuGroupedLoraLinear(nn.Module):
     """Generic grouped linear for low-rank NPU LoRA adapters."""
 
-    def __init__(self, num_gemms: int, input_size: int, output_size: int, *, config, bias: bool):
+    def __init__(self, num_gemms: int, input_size: int, output_size: int, *, config, bias: bool,
+                 is_expert: bool = False):
         super().__init__()
         self.num_gemms = num_gemms
         self.input_size = input_size
         self.output_size = output_size
         self.use_bias = bias
+        self.is_expert = is_expert
         self.parallel_mode = None
         device = torch.device('cpu') if config.use_cpu_initialization else get_current_device()
         dtype = config.params_dtype
@@ -77,6 +83,58 @@ class NpuGroupedLoraLinear(nn.Module):
     @property
     def weight(self):
         return self.weight0
+
+    def _set_expert_replica_id(self, sharded_tensor):
+        replica_id = sharded_tensor.replica_id
+        assert len(replica_id) == 3, f'Expected replica_id to be in (PP, TP, DP) format, got: {replica_id}'
+        if getattr(sharded_tensor, 'is_data_parallel_fully_shard', False):
+            edp_replica_id = 0
+        else:
+            edp_replica_id = parallel_state.get_expert_data_parallel_rank()
+        sharded_tensor.replica_id = (*replica_id[:2], edp_replica_id)
+        return sharded_tensor
+
+    def sharded_state_dict(
+            self,
+            prefix: str = '',
+            sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+            metadata: Optional[dict] = None,
+    ):
+        if not self.is_expert:
+            return make_sharded_tensors_for_checkpoint(
+                self.state_dict(prefix='', keep_vars=True),
+                prefix,
+                sharded_offsets=sharded_offsets,
+            )
+
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+        num_global_experts = parallel_state.get_expert_model_parallel_world_size() * self.num_gemms
+        local_expert_indices_offset = parallel_state.get_expert_model_parallel_rank() * self.num_gemms
+        ep_axis = len(sharded_offsets)
+        sharded_state_dict = {}
+
+        for i in range(self.num_gemms):
+            global_expert_idx = local_expert_indices_offset + i
+            if singleton_local_shards:
+                key_prefix = f'{global_expert_idx}.{prefix}'
+                new_sharded_offsets = sharded_offsets
+            else:
+                key_prefix = prefix
+                new_sharded_offsets = (*sharded_offsets, (ep_axis, global_expert_idx, num_global_experts))
+
+            for param_name in ('weight', 'bias'):
+                local_name = f'{param_name}{i}'
+                param = getattr(self, local_name, None)
+                if param is None:
+                    continue
+                sharded_tensor = make_sharded_tensor_for_checkpoint(
+                    param,
+                    f'{key_prefix}{param_name}',
+                    prepend_offsets=new_sharded_offsets,
+                )
+                sharded_state_dict[f'{prefix}{local_name}'] = self._set_expert_replica_id(sharded_tensor)
+
+        return sharded_state_dict
 
     def _fallback_forward(self, x, m_splits):
         if isinstance(m_splits, torch.Tensor):

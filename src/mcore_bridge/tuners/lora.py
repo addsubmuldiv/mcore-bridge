@@ -184,9 +184,11 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
             if self.is_grouped:
                 if is_torch_npu_available():
                     lora_a = NpuGroupedLoraLinear(
-                        self.base_layer.num_gemms, in_features, r, config=self.config, bias=False)
+                        self.base_layer.num_gemms, in_features, r, config=self.config, bias=False,
+                        is_expert=self.is_expert)
                     lora_b = NpuGroupedLoraLinear(
-                        self.base_layer.num_gemms, r, self.out_features, config=self.config, bias=lora_bias)
+                        self.base_layer.num_gemms, r, self.out_features, config=self.config, bias=lora_bias,
+                        is_expert=self.is_expert)
                 else:
                     lora_a = TERowParallelGroupedLinear(
                         num_gemms=self.base_layer.num_gemms,
@@ -221,9 +223,11 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
             if self.is_grouped:
                 if is_torch_npu_available():
                     lora_a = NpuGroupedLoraLinear(
-                        self.base_layer.num_gemms, self.in_features, r, config=self.config, bias=lora_bias)
+                        self.base_layer.num_gemms, self.in_features, r, config=self.config, bias=lora_bias,
+                        is_expert=self.is_expert)
                     lora_b = NpuGroupedLoraLinear(
-                        self.base_layer.num_gemms, r, out_features, config=self.config, bias=lora_bias)
+                        self.base_layer.num_gemms, r, out_features, config=self.config, bias=lora_bias,
+                        is_expert=self.is_expert)
                 else:
                     lora_a = TEGroupedLinear(
                         num_gemms=self.base_layer.num_gemms,
