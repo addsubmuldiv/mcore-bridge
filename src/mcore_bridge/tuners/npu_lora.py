@@ -3,9 +3,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import TEGroupedLinear
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.utils import make_sharded_tensor_for_checkpoint
-from megatron.core.extensions.transformer_engine import TEGroupedLinear
 from transformers.utils import is_torch_npu_available
 from typing import Optional, Tuple
 
@@ -58,7 +58,13 @@ def is_expert_layer(base_layer) -> bool:
 class NpuGroupedLoraLinear(nn.Module):
     """Generic grouped linear for low-rank NPU LoRA adapters."""
 
-    def __init__(self, num_gemms: int, input_size: int, output_size: int, *, config, bias: bool,
+    def __init__(self,
+                 num_gemms: int,
+                 input_size: int,
+                 output_size: int,
+                 *,
+                 config,
+                 bias: bool,
                  is_expert: bool = False):
         super().__init__()
         self.num_gemms = num_gemms
@@ -166,6 +172,7 @@ class NpuGroupedLoraLinear(nn.Module):
 
 
 class _NpuGroupedLoraLinearGMM(torch.autograd.Function):
+
     @staticmethod
     def forward(ctx, input_tensor, m_splits, weights, *weight_input_T):
         import torch_npu
