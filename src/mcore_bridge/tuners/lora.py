@@ -28,6 +28,7 @@ from typing import Any, List, Optional, Tuple
 
 from mcore_bridge.utils import get_current_device
 
+from .npu_lora import NpuGroupedLoraLinear, is_expert_layer
 from .utils import tuners_sharded_state_dict
 
 mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
@@ -119,7 +120,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         self.is_grouped = isinstance(base_layer, TEGroupedLinear)
         self.fan_in_fan_out = fan_in_fan_out
         self._active_adapter = adapter_name
-        self.is_expert = getattr(base_layer, 'is_expert', False)
+        self.is_expert = is_expert_layer(base_layer)
         self.sequence_parallel = getattr(base_layer, 'sequence_parallel', False)
         if self.is_expert:
             self.tp_size = get_expert_tensor_parallel_world_size()
@@ -181,21 +182,37 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         elif self.is_parallel_a:
             in_features = self.in_features * self.tp_size
             if self.is_grouped:
-                lora_a = TERowParallelGroupedLinear(
-                    num_gemms=self.base_layer.num_gemms,
-                    input_size=in_features,
-                    output_size=r,
-                    bias=False,
-                    **kwargs,
-                )
-                lora_b = TEGroupedLinear(
-                    num_gemms=self.base_layer.num_gemms,
-                    input_size=r,
-                    output_size=self.out_features,
-                    bias=lora_bias,
-                    parallel_mode=None,
-                    **kwargs,
-                )
+                if is_torch_npu_available():
+                    lora_a = NpuGroupedLoraLinear(
+                        self.base_layer.num_gemms,
+                        in_features,
+                        r,
+                        config=self.config,
+                        bias=False,
+                        is_expert=self.is_expert)
+                    lora_b = NpuGroupedLoraLinear(
+                        self.base_layer.num_gemms,
+                        r,
+                        self.out_features,
+                        config=self.config,
+                        bias=lora_bias,
+                        is_expert=self.is_expert)
+                else:
+                    lora_a = TERowParallelGroupedLinear(
+                        num_gemms=self.base_layer.num_gemms,
+                        input_size=in_features,
+                        output_size=r,
+                        bias=False,
+                        **kwargs,
+                    )
+                    lora_b = TEGroupedLinear(
+                        num_gemms=self.base_layer.num_gemms,
+                        input_size=r,
+                        output_size=self.out_features,
+                        bias=lora_bias,
+                        parallel_mode=None,
+                        **kwargs,
+                    )
             else:
                 lora_a = TERowParallelLinear(
                     input_size=in_features,
@@ -212,20 +229,36 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
             else:
                 out_features = self.out_features * self.tp_size
             if self.is_grouped:
-                lora_a = TEGroupedLinear(
-                    num_gemms=self.base_layer.num_gemms,
-                    input_size=self.in_features,
-                    output_size=r,
-                    bias=lora_bias,
-                    parallel_mode=None,
-                    **kwargs)
-                lora_b = TEColumnParallelGroupedLinear(
-                    num_gemms=self.base_layer.num_gemms,
-                    input_size=r,
-                    output_size=out_features,
-                    bias=lora_bias,
-                    **kwargs,
-                )
+                if is_torch_npu_available():
+                    lora_a = NpuGroupedLoraLinear(
+                        self.base_layer.num_gemms,
+                        self.in_features,
+                        r,
+                        config=self.config,
+                        bias=lora_bias,
+                        is_expert=self.is_expert)
+                    lora_b = NpuGroupedLoraLinear(
+                        self.base_layer.num_gemms,
+                        r,
+                        out_features,
+                        config=self.config,
+                        bias=lora_bias,
+                        is_expert=self.is_expert)
+                else:
+                    lora_a = TEGroupedLinear(
+                        num_gemms=self.base_layer.num_gemms,
+                        input_size=self.in_features,
+                        output_size=r,
+                        bias=lora_bias,
+                        parallel_mode=None,
+                        **kwargs)
+                    lora_b = TEColumnParallelGroupedLinear(
+                        num_gemms=self.base_layer.num_gemms,
+                        input_size=r,
+                        output_size=out_features,
+                        bias=lora_bias,
+                        **kwargs,
+                    )
             else:
                 lora_a = _build_local_te_linear(self.in_features, r, lora_bias, **kwargs)
                 lora_b = TEColumnParallelLinear(
@@ -279,11 +312,11 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         if adapter_name in self.lora_A.keys():
             lora_a = self.lora_A[adapter_name]
             lora_b = self.lora_B[adapter_name]
-            if isinstance(lora_a, TEGroupedLinear):
+            if isinstance(lora_a, (TEGroupedLinear, NpuGroupedLoraLinear)):
                 weights_a = [getattr(lora_a, f'weight{i}') for i in range(lora_a.num_gemms)]
             else:
                 weights_a = [lora_a.weight]
-            if isinstance(lora_b, TEGroupedLinear):
+            if isinstance(lora_b, (TEGroupedLinear, NpuGroupedLoraLinear)):
                 weights_b = [getattr(lora_b, f'weight{i}') for i in range(lora_b.num_gemms)]
             else:
                 weights_b = [lora_b.weight]
@@ -394,15 +427,16 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 lora_B = self.lora_B[active_adapter]
                 dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
-                dtype = lora_A.weight0.dtype if isinstance(lora_A, TEGroupedLinear) else lora_A.weight.dtype
+                dtype = lora_A.weight0.dtype if isinstance(lora_A, (TEGroupedLinear,
+                                                                    NpuGroupedLoraLinear)) else lora_A.weight.dtype
                 x = x.to(dtype)
 
-                lora_result = lora_A(dropout(x), *args, **kwargs) if isinstance(lora_A, TEGroupedLinear) else lora_A(
-                    dropout(x))
+                lora_result = lora_A(dropout(x), *args, **kwargs) if isinstance(
+                    lora_A, (TEGroupedLinear, NpuGroupedLoraLinear)) else lora_A(dropout(x))
                 if isinstance(lora_result, tuple):
                     lora_result = lora_result[0]
                 lora_result = lora_B(lora_result, *args, **kwargs) if isinstance(
-                    lora_B, TEGroupedLinear) else lora_B(lora_result)
+                    lora_B, (TEGroupedLinear, NpuGroupedLoraLinear)) else lora_B(lora_result)
                 if isinstance(lora_result, tuple):
                     lora_result = lora_result[0]
                 lora_result = lora_result * scaling
