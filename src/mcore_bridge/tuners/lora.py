@@ -372,8 +372,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 result, bias = self.base_layer(x, *args, **kwargs)
             else:
                 if is_torch_npu_available():
-                    result, bias, x = _forward_npu_layernorm_column(
-                        self.base_layer, x, args, kwargs)
+                    result, bias, x = _forward_npu_layernorm_column(self.base_layer, x, args, kwargs)
                 else:
                     self.base_layer.return_layernorm_output = True
                     (result, x), bias = self.base_layer(x, *args, **kwargs)
