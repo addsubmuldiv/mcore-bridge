@@ -166,8 +166,9 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
 
         self.lora_dropout[adapter_name] = lora_dropout_layer
 
-        replicated_base = (is_torch_npu_available() and isinstance(self.base_layer, TELinear)
-                           and getattr(self.base_layer, 'parallel_mode', None) == 'duplicated')
+        replicated_base = (
+            is_torch_npu_available() and isinstance(self.base_layer, TELinear)
+            and getattr(self.base_layer, 'parallel_mode', None) == 'duplicated')
         # lora needs to be forced to upgrade to 32-bit precision, otherwise it will overflow
         kwargs = {
             'skip_bias_add': False,
@@ -281,7 +282,8 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                         gather_output=False,
                         **kwargs,
                     )
-                    lora_b.parallel_mode = getattr(self.base_layer, 'parallel_mode', None)  # fix moe_shared_expert_overlap
+                    lora_b.parallel_mode = getattr(self.base_layer, 'parallel_mode',
+                                                   None)  # fix moe_shared_expert_overlap
         for lora in [lora_a, lora_b]:
             # When parallel_mode is set to None by moe_shared_expert_overlap,
             # disable UB comm overlap; the corresponding collectives are driven
