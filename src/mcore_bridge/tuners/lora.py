@@ -16,6 +16,7 @@ from megatron.core.extensions.transformer_engine import (TEColumnParallelGrouped
                                                          TERowParallelGroupedLinear, TERowParallelLinear)
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.parallel_state import get_expert_tensor_parallel_world_size, get_tensor_model_parallel_world_size
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
@@ -215,15 +216,19 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                         **kwargs,
                     )
             else:
+                # MindSpeed aliases TERowParallelLinear to the native mcore class,
+                # whose input_size is global (sharded internally), unlike TE where
+                # the per-shard size is passed. Reuse the full size on NPU.
+                row_input_size = self.in_features if is_torch_npu_available() else in_features
                 lora_a = TERowParallelLinear(
-                    input_size=in_features,
+                    input_size=row_input_size,
                     output_size=r,
                     bias=False,
                     input_is_parallel=True,
                     **kwargs,
                 )
                 lora_b = _build_local_te_linear(r, self.out_features, lora_bias, **kwargs)
-                lora_a.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
+                lora_a.parallel_mode = getattr(self.base_layer, 'parallel_mode', None)  # fix moe_shared_expert_overlap
         else:
             if is_torch_npu_available():
                 out_features = self.out_features
@@ -269,7 +274,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     gather_output=False,
                     **kwargs,
                 )
-                lora_b.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
+                lora_b.parallel_mode = getattr(self.base_layer, 'parallel_mode', None)  # fix moe_shared_expert_overlap
         for lora in [lora_a, lora_b]:
             # When parallel_mode is set to None by moe_shared_expert_overlap,
             # disable UB comm overlap; the corresponding collectives are driven
@@ -426,6 +431,12 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 else:
                     (result, x), bias = self.base_layer(x, *args, **kwargs)
         elif isinstance(self.base_layer, (TELinear, TEGroupedLinear)):
+            result, bias = self.base_layer(x, *args, **kwargs)
+        elif isinstance(self.base_layer, (ColumnParallelLinear, RowParallelLinear)):
+            # Native mcore parallel linears: MindSpeed on NPU aliases the TE
+            # column/row classes to these, so a spec written with
+            # TEColumnParallelLinear/TERowParallelLinear produces native layers
+            # there. Their forward also returns (output, output_bias).
             result, bias = self.base_layer(x, *args, **kwargs)
         elif isinstance(self.base_layer, TopKRouter):
             with self._patch_router_gating():

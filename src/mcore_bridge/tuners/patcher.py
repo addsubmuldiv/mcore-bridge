@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.router import TopKRouter
 from peft import LoraModel
@@ -27,7 +28,12 @@ def dispatch_megatron(
     else:
         target_base_layer = target
 
-    linear_cls = (TELayerNormColumnParallelLinear, TELinear, TEGroupedLinear, TopKRouter)
+    # MindSpeed aliases TEColumnParallelLinear/TERowParallelLinear to the native
+    # mcore classes (breaking the TELinear inheritance used on CUDA), so the
+    # native classes must be dispatched as well. On CUDA these never match:
+    # every LoRA-capable projection there is built as a TE class.
+    linear_cls = (TELayerNormColumnParallelLinear, TELinear, TEGroupedLinear, TopKRouter, ColumnParallelLinear,
+                  RowParallelLinear)
     if isinstance(target_base_layer, linear_cls):
         new_module = LoraParallelLinear(base_layer=target, adapter_name=adapter_name, **kwargs)
 
