@@ -118,7 +118,8 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         if use_dora:
             raise ValueError(f'{self.__class__.__name__} does not support DoRA yet, please set it to False')
 
-        self.is_parallel_a = isinstance(base_layer, (TERowParallelLinear, TERowParallelGroupedLinear))
+        self.is_parallel_a = isinstance(base_layer,
+                                        (TERowParallelLinear, TERowParallelGroupedLinear, RowParallelLinear))
         self.is_grouped = isinstance(base_layer, TEGroupedLinear)
         self.fan_in_fan_out = fan_in_fan_out
         self._active_adapter = adapter_name
@@ -219,13 +220,14 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                         **kwargs,
                     )
             else:
-                # Native NPU RowParallelLinear takes the global input size.
-                row_input_size = self.in_features if is_torch_npu_available() else in_features
-                lora_a = TERowParallelLinear(
+                native_row = isinstance(self.base_layer, RowParallelLinear)
+                row_input_size = self.in_features if native_row or is_torch_npu_available() else in_features
+                row_linear_cls = RowParallelLinear if native_row else TERowParallelLinear
+                lora_a = row_linear_cls(
                     input_size=row_input_size,
                     output_size=r,
                     bias=False,
-                    input_is_parallel=True,
+                    input_is_parallel=getattr(self.base_layer, 'input_is_parallel', True),
                     **kwargs,
                 )
                 lora_b = _build_local_te_linear(r, self.out_features, lora_bias, **kwargs)
