@@ -219,9 +219,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                         **kwargs,
                     )
             else:
-                # MindSpeed aliases TERowParallelLinear to the native mcore class,
-                # whose input_size is global (sharded internally), unlike TE where
-                # the per-shard size is passed. Reuse the full size on NPU.
+                # Native NPU RowParallelLinear takes the global input size.
                 row_input_size = self.in_features if is_torch_npu_available() else in_features
                 lora_a = TERowParallelLinear(
                     input_size=row_input_size,
@@ -271,8 +269,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
             else:
                 lora_a = _build_local_te_linear(self.in_features, r, lora_bias, **kwargs)
                 if replicated_base:
-                    # MindSpeed's column linear splits the output by TP, while
-                    # a duplicated TELinear keeps the full output on each rank.
+                    # Match the base layer's replicated output.
                     lora_b = _build_local_te_linear(r, self.out_features, lora_bias, **kwargs)
                 else:
                     lora_b = TEColumnParallelLinear(
@@ -294,14 +291,8 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 lora.ub_overlap_ag_fprop = False
                 lora.ub_overlap_rs_dgrad = False
 
-        # With sequence parallelism the replicated (non-sharded) LoRA factor only sees this TP
-        # rank's sequence shard: for RowParallel targets lora_A reduce-scatters its output before
-        # lora_B, and for ColumnParallel targets lora_A consumes the sequence-sharded input. Its
-        # gradient must therefore be summed over the TP group. Megatron does this in
-        # finalize_model_grads for parameters flagged `sequence_parallel` (same as layernorm
-        # weights); without the flag each TP rank trains a different copy and export_weights
-        # saves rank 0 only (observed: last layer linear_proj.lora_B saved as all zeros).
-        # For a duplicated base, both factors see the local sequence shard.
+        # Sequence-parallel inputs need TP reduction for replicated LoRA weights.
+        # Both factors are replicated when the base layer is duplicated.
         if (self.tp_size > 1 and not isinstance(self.base_layer, TopKRouter)
                 and (getattr(self.config, 'sequence_parallel', False) or self.sequence_parallel)):
             replicated_factors = (lora_a, lora_b) if replicated_base else (lora_b if self.is_parallel_a else lora_a, )
@@ -444,10 +435,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         elif isinstance(self.base_layer, (TELinear, TEGroupedLinear)):
             result, bias = self.base_layer(x, *args, **kwargs)
         elif isinstance(self.base_layer, (ColumnParallelLinear, RowParallelLinear)):
-            # Native mcore parallel linears: MindSpeed on NPU aliases the TE
-            # column/row classes to these, so a spec written with
-            # TEColumnParallelLinear/TERowParallelLinear produces native layers
-            # there. Their forward also returns (output, output_bias).
+            # Native parallel linears return (output, bias).
             result, bias = self.base_layer(x, *args, **kwargs)
         elif isinstance(self.base_layer, TopKRouter):
             with self._patch_router_gating():

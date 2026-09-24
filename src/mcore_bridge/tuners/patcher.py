@@ -28,10 +28,7 @@ def dispatch_megatron(
     else:
         target_base_layer = target
 
-    # MindSpeed aliases TEColumnParallelLinear/TERowParallelLinear to the native
-    # mcore classes (breaking the TELinear inheritance used on CUDA), so the
-    # native classes must be dispatched as well. On CUDA these never match:
-    # every LoRA-capable projection there is built as a TE class.
+    # MindSpeed uses native mcore classes for TE parallel linears.
     linear_cls = (TELayerNormColumnParallelLinear, TELinear, TEGroupedLinear, TopKRouter, ColumnParallelLinear,
                   RowParallelLinear)
     if isinstance(target_base_layer, linear_cls):
