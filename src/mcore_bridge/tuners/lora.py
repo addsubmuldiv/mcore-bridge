@@ -166,6 +166,8 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
 
         self.lora_dropout[adapter_name] = lora_dropout_layer
 
+        replicated_base = (is_torch_npu_available() and isinstance(self.base_layer, TELinear)
+                           and getattr(self.base_layer, 'parallel_mode', None) == 'duplicated')
         # lora needs to be forced to upgrade to 32-bit precision, otherwise it will overflow
         kwargs = {
             'skip_bias_add': False,
@@ -267,14 +269,19 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     )
             else:
                 lora_a = _build_local_te_linear(self.in_features, r, lora_bias, **kwargs)
-                lora_b = TEColumnParallelLinear(
-                    input_size=r,
-                    output_size=out_features,
-                    bias=lora_bias,
-                    gather_output=False,
-                    **kwargs,
-                )
-                lora_b.parallel_mode = getattr(self.base_layer, 'parallel_mode', None)  # fix moe_shared_expert_overlap
+                if replicated_base:
+                    # MindSpeed's column linear splits the output by TP, while
+                    # a duplicated TELinear keeps the full output on each rank.
+                    lora_b = _build_local_te_linear(r, self.out_features, lora_bias, **kwargs)
+                else:
+                    lora_b = TEColumnParallelLinear(
+                        input_size=r,
+                        output_size=out_features,
+                        bias=lora_bias,
+                        gather_output=False,
+                        **kwargs,
+                    )
+                    lora_b.parallel_mode = getattr(self.base_layer, 'parallel_mode', None)  # fix moe_shared_expert_overlap
         for lora in [lora_a, lora_b]:
             # When parallel_mode is set to None by moe_shared_expert_overlap,
             # disable UB comm overlap; the corresponding collectives are driven
@@ -292,11 +299,13 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         # finalize_model_grads for parameters flagged `sequence_parallel` (same as layernorm
         # weights); without the flag each TP rank trains a different copy and export_weights
         # saves rank 0 only (observed: last layer linear_proj.lora_B saved as all zeros).
+        # For a duplicated base, both factors see the local sequence shard.
         if (self.tp_size > 1 and not isinstance(self.base_layer, TopKRouter)
                 and (getattr(self.config, 'sequence_parallel', False) or self.sequence_parallel)):
-            replicated = lora_b if self.is_parallel_a else lora_a
-            for p in replicated.parameters():
-                p.sequence_parallel = True
+            replicated_factors = (lora_a, lora_b) if replicated_base else (lora_b if self.is_parallel_a else lora_a, )
+            for factor in replicated_factors:
+                for p in factor.parameters():
+                    p.sequence_parallel = True
         self.lora_A[adapter_name] = lora_a
         self.lora_B[adapter_name] = lora_b
         if hasattr(self, 'lora_bias'):
