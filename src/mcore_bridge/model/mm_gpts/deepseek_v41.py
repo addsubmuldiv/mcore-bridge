@@ -29,6 +29,7 @@ Requires a megatron-core that ships ``megatron.core.models.hybrid``; without it 
 registered at all (see ``_HYBRID_MODEL_AVAILABLE``).
 """
 import copy
+import inspect
 import os
 import torch
 import torch.distributed as dist
@@ -60,7 +61,7 @@ from mcore_bridge.config import MLAModelConfig
 from mcore_bridge.model.modules.dspark import DeepseekV41DSparkStack
 from mcore_bridge.model.modules.engram import (DeepseekV41Engram, DeepseekV41TransformerLayer,
                                                build_deepseek_v41_engram_config, has_native_engram)
-from mcore_bridge.utils import is_master
+from mcore_bridge.utils import Fp8Dequantizer, is_master
 
 from ..constant import ModelType
 from ..gpts.deepseek_v4 import DeepseekV4Bridge, DeepseekV4Loader, DSv4HybridSelfAttention, _apply_mla_rope
@@ -1100,6 +1101,9 @@ class DeepseekV41Loader(DeepseekV4Loader):
         """
         if not self.config.enable_hyper_connections or DeepseekV41HyperConnectionHybridLayer is None:
             return
+        if '_maybe_apply_engram(' in inspect.getsource(HyperConnectionHybridLayer.forward):
+            # This native HybridStack already injects Engram before mHC aggregation.
+            return
         decoder = getattr(model, 'decoder', None)
         for layer in getattr(decoder, 'layers', []) or []:
             inner = getattr(layer, 'inner_layer', None)
@@ -1383,8 +1387,9 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
         # this method (see ``_convert``'s ``is_pp_first_stage`` guard).
         result = super()._convert_pre_process(mg_model, hf_state_dict, hf_prefix, to_mcore)
         target = hf_state_dict if to_mcore else result
-        for name in ('image_start', 'image_end', 'image_newline'):
-            self._set_state_dict(mg_model, f'visual.{name}', target, f'model.{name}', to_mcore)
+        if not self.config.language_model_only:
+            for name in ('image_start', 'image_end', 'image_newline'):
+                self._set_state_dict(mg_model, f'visual.{name}', target, f'model.{name}', to_mcore)
         return result
 
     def _convert_post_process(self, mg_model, hf_state_dict, hf_prefix: str, to_mcore: bool):
@@ -1591,10 +1596,12 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
     def _dequantize_engram_rows(weight, scale):
         if scale is None:
             return weight
-        if weight.ndim != 2 or scale.ndim != 2 or weight.shape[0] != scale.shape[0]:
+        if weight.ndim != 2 or scale.ndim != 2 or weight.shape[0] % scale.shape[0] != 0:
             raise ValueError(f'Invalid Engram FP8 weight/scale shapes: {tuple(weight.shape)} and {tuple(scale.shape)}.')
         if weight.shape[1] % scale.shape[1] != 0:
             raise ValueError(f'Engram weight width {weight.shape[1]} is not divisible by scale width {scale.shape[1]}.')
+        if weight.shape[0] != scale.shape[0]:
+            return Fp8Dequantizer(block_size='auto').convert(weight, scale)
         block_size = weight.shape[1] // scale.shape[1]
         return (weight.float().unflatten(-1, (-1, block_size)) * scale.float().unsqueeze(-1)).flatten(-2)
 

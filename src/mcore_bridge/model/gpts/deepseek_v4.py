@@ -708,6 +708,9 @@ class DeepseekV4Bridge(GPTBridge):
         is_fp4 = tensor.dtype == torch.int8 and tensor.shape[-1] * 2 == param.shape[-1]
         if not is_fp4:
             return super()._set_param(param, tensor, scale_inv)
+        if param.device.type == 'npu' and not self._is_fp8_param(param):
+            tensor = tensor.cpu()
+            scale_inv = scale_inv.cpu()
         tensor = fp4_to_fp8(tensor)
         tensor = tensor.reshape(*param.shape)
         scale_inv = scale_inv.reshape(-1, scale_inv.shape[-1])
