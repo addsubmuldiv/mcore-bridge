@@ -9,7 +9,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
-from mcore_bridge.utils import Fp8Dequantizer, fp4_to_fp8
+from mcore_bridge.utils import Fp8Dequantizer, fp4_to_fp32
 
 from ..constant import ModelType
 from ..gpt_model import GPTModel
@@ -712,7 +712,10 @@ class DeepseekV4Bridge(GPTBridge):
         is_fp4 = tensor.dtype == torch.int8 and tensor.shape[-1] * 2 == param.shape[-1]
         if not is_fp4:
             return super()._set_param(param, tensor, scale_inv)
-        tensor = fp4_to_fp8(tensor)
+        if param.device.type == 'npu':
+            tensor = tensor.to(param.device)
+            scale_inv = scale_inv.to(param.device)
+        tensor = fp4_to_fp32(tensor)
         tensor = tensor.reshape(*param.shape)
         scale_inv = scale_inv.reshape(-1, scale_inv.shape[-1])
         tensor = Fp8Dequantizer(block_size='auto').convert(tensor, scale_inv)

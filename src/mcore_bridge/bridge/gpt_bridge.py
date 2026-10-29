@@ -16,8 +16,8 @@ from typing import Callable, List, Optional, Union
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.tuners import LoraParallelLinear
-from mcore_bridge.utils import (MxFp4Dequantizer, PackedDequantizer, SafetensorLazyLoader, StreamingSafetensorSaver,
-                                deep_getattr, gc_collect, get_logger, is_master, unwrap_model)
+from mcore_bridge.utils import (Fp8Dequantizer, MxFp4Dequantizer, PackedDequantizer, SafetensorLazyLoader,
+                                StreamingSafetensorSaver, deep_getattr, gc_collect, get_logger, is_master, unwrap_model)
 from mcore_bridge.utils.constants import EXPORT_CHUNK_BYTES
 
 logger = get_logger()
@@ -227,10 +227,15 @@ class GPTBridge:
                 del param.get_high_precision_init_val
         else:
             if hf_scale_inv is not None:
-                fp8_tensor = self.fp8_quantizer.make_empty(tensor.shape)
-                fp8_tensor._rowwise_data.copy_(tensor.view(torch.uint8))
-                self._copy_scale_inv(fp8_tensor, hf_scale_inv)
-                tensor = fp8_tensor
+                if param.device.type == 'npu':
+                    scales = hf_scale_inv.reshape(-1, hf_scale_inv.shape[-1])
+                    tensor = tensor.view(torch.uint8).to(param.device)
+                    tensor = Fp8Dequantizer(block_size='auto').convert(tensor, scales.to(param.device))
+                else:
+                    fp8_tensor = self.fp8_quantizer.make_empty(tensor.shape)
+                    fp8_tensor._rowwise_data.copy_(tensor.view(torch.uint8))
+                    self._copy_scale_inv(fp8_tensor, hf_scale_inv)
+                    tensor = fp8_tensor
             param.data.copy_(tensor)
 
     @staticmethod

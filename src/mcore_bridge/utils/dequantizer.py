@@ -1,6 +1,20 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
+from functools import lru_cache
 from typing import Optional, Sequence, Tuple, Union
+
+
+@lru_cache(maxsize=16)
+def _fp8_decode_table(dtype, device):
+    # Only the 256-entry constant is built on CPU; weight decoding stays on device.
+    return torch.arange(256, dtype=torch.uint8, device='cpu').view(dtype).float().to(device)
+
+
+def _to_float32(tensor):
+    if tensor.device.type == 'npu' and tensor.is_floating_point() and tensor.element_size() == 1:
+        # Avoid NPU float8 casts for both checkpoint weights and UE8M0 scales.
+        return _fp8_decode_table(tensor.dtype, tensor.device)[tensor.view(torch.uint8).long()]
+    return tensor.to(torch.float32)
 
 
 class Fp8Dequantizer:
@@ -20,7 +34,7 @@ class Fp8Dequantizer:
             raise TypeError('Fp8Dequantize expects tensors as inputs.')
         if quantized.dtype == torch.uint8:
             quantized = quantized.view(torch.float8_e4m3fn)
-        quantized_fp32 = quantized.to(torch.float32)
+        quantized_fp32 = _to_float32(quantized)
         rows, cols = quantized_fp32.shape[-2:]
         scale_rows, scale_cols = scales.shape[-2:]
         block_size = self.block_size
@@ -40,7 +54,7 @@ class Fp8Dequantizer:
         p_rows, p_cols = input_tensor.shape[-2:]
 
         reshaped = input_tensor.reshape(-1, p_rows // block_m, block_m, p_cols // block_n, block_n)
-        expanded_scales = scales.to(torch.float32).reshape(-1, p_rows // block_m, p_cols // block_n)
+        expanded_scales = _to_float32(scales).reshape(-1, p_rows // block_m, p_cols // block_n)
         expanded_scales = expanded_scales.unsqueeze(-1).unsqueeze(2)
 
         dequantized = reshaped * expanded_scales
@@ -66,7 +80,7 @@ class MxFp4Dequantizer:
 _FP4_E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 
 
-def fp4_to_fp8(packed: torch.Tensor) -> torch.Tensor:
+def fp4_to_fp32(packed: torch.Tensor) -> torch.Tensor:
     lut = torch.tensor(_FP4_E2M1_LUT, dtype=torch.float32, device=packed.device)
     u8 = packed.contiguous().view(torch.uint8)
     low = (u8 & 0x0F).long()
@@ -78,7 +92,11 @@ def fp4_to_fp8(packed: torch.Tensor) -> torch.Tensor:
     unpacked = torch.stack([low_f32, high_f32], dim=-1)
     unpacked = unpacked.reshape(*packed.shape[:-1], 2 * packed.shape[-1])
 
-    return unpacked.to(torch.float8_e4m3fn)
+    return unpacked
+
+
+def fp4_to_fp8(packed: torch.Tensor) -> torch.Tensor:
+    return fp4_to_fp32(packed).to(torch.float8_e4m3fn)
 
 
 class PackedDequantizer:

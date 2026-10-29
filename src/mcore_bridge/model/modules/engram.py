@@ -2,6 +2,7 @@
 """DeepSeek-V4.1 adapters for NVIDIA Megatron-Core's optional Engram modules."""
 
 import dataclasses
+import inspect
 import torch
 from torch import Tensor
 
@@ -11,8 +12,7 @@ try:
     from megatron.core import mpu
     from megatron.core.models.engram.config import EngramConfig
     from megatron.core.models.engram.engram import Engram
-    from megatron.core.models.engram.hashing import (compress_token_ids, shift_right_reset_at_eos,
-                                                     slice_hashes_for_sequence_parallel)
+    from megatron.core.models.engram.hashing import compress_token_ids, shift_right_reset_at_eos
     from megatron.core.transformer.transformer_layer import HyperConnectionTransformerLayer, TransformerLayer
     from megatron.core.utils import get_pg_size, nvtx_range_pop, nvtx_range_push
 except ImportError:
@@ -20,6 +20,16 @@ except ImportError:
     Engram = torch.nn.Module
     HyperConnectionTransformerLayer = None
     TransformerLayer = None
+
+try:
+    from megatron.core.models.engram.hashing import slice_hashes_for_sequence_parallel
+except ImportError:
+
+    def slice_hashes_for_sequence_parallel(hash_ids, local_sequence_length, tp_group):
+        # Older native Engram snapshots support TP=1 without SP only.
+        if get_pg_size(tp_group) != 1 or hash_ids.shape[1] != local_sequence_length:
+            raise NotImplementedError('This Megatron Engram snapshot requires TP=1 without SP.')
+        return hash_ids
 
 
 def has_native_engram() -> bool:
@@ -86,6 +96,8 @@ if EngramConfig is not None:
             if len(placement_layer_ids) != len(self.hash_layer_ids):
                 raise ValueError('Engram placement and hash layer IDs must have the same length.')
             self.excluded_token_ids = tuple(excluded_token_ids)
+            if any(field.name == 'hash_layer_ids' for field in dataclasses.fields(EngramConfig)):
+                kwargs['hash_layer_ids'] = self.hash_layer_ids
             super().__init__(layer_ids=placement_layer_ids, **kwargs)
             hash_multipliers = self.layer_multipliers
             self.layer_multipliers = {
@@ -103,7 +115,7 @@ if EngramConfig is not None:
             finally:
                 self.layer_ids = placement_layer_ids
 
-        def _validate_parallelism(self, transformer_config, sequence_length):
+        def _validate_parallelism(self, transformer_config, sequence_length=None):
             # Drop only the upstream CP and VPP rejections (see _RelaxedParallelismView for why
             # both are safe on the V4.1 hybrid path) and keep every other check -- etp==tp, the
             # SP rank-local history length, etc. CP shortens the rank-local slice the SP check
@@ -112,7 +124,11 @@ if EngramConfig is not None:
             if sequence_length is not None:
                 # The SP checks compare against a rank-local slice, which CP shortens first.
                 sequence_length = sequence_length // context_parallel_size
-            super()._validate_parallelism(_RelaxedParallelismView(transformer_config), sequence_length)
+            validate = super()._validate_parallelism
+            if 'sequence_length' in inspect.signature(validate).parameters:
+                validate(_RelaxedParallelismView(transformer_config), sequence_length)
+            else:
+                validate(_RelaxedParallelismView(transformer_config))
 
         def _validate_packed_sequences(self, transformer_config, packed_sequences):
             # DeepseekV41Engram restarts its n-gram windows at every cu_seqlens document
@@ -242,6 +258,8 @@ class DeepseekV41Engram(Engram):
         if EngramConfig is None:
             raise RuntimeError('The installed Megatron-Core does not provide Engram.')
         super().__init__(*args, **kwargs)
+        if not hasattr(self, 'tp_group'):
+            self.tp_group = self.pg_collection.tp
         # PR #7231's DeepSeek variant predates the released V4.1 checkpoint layout.
         # Keep its initialized weights but remove parameters absent from that checkpoint.
         self.value_projection.register_parameter('bias', None)
@@ -306,13 +324,22 @@ class DeepseekV41Engram(Engram):
             return hashes
         return split_cp_inputs(hashes, None, 1, cp_partition_mode='contiguous')
 
-    def forward(self, hidden_states: Tensor, input_ids: Tensor, inference_context=None) -> Tensor:
+    def forward(self,
+                hidden_states: Tensor,
+                input_ids: Tensor,
+                inference_context=None,
+                *,
+                add_residual=False,
+                packed_seq_params=None) -> Tensor:
+        if hasattr(inference_context, 'qkv_format'):
+            packed_seq_params, inference_context = inference_context, None
         if inference_context is None:
             inference_context = getattr(self, '_bridge_inference_context', None)
         if inference_context is not None:
             raise RuntimeError('DeepSeek-V4.1 Engram inference is not wired into this integration; rollout runs '
                                'through vLLM, so the Engram module supports the training forward only.')
-        packed_seq_params = getattr(self, '_bridge_packed_seq_params', None)
+        if packed_seq_params is None:
+            packed_seq_params = getattr(self, '_bridge_packed_seq_params', None)
         if hidden_states.ndim != 3:
             raise ValueError(f'Engram hidden_states must be [S,B,H], got {hidden_states.shape}.')
         expected_hidden = self.num_streams * self.hidden_size
@@ -367,7 +394,8 @@ class DeepseekV41Engram(Engram):
         score = score.abs().clamp_min(1e-6).sqrt() * score.sign()
         output = score.sigmoid().unsqueeze(-1) * shared_value.unsqueeze(2)
         output = output * live_tokens.transpose(0, 1).unsqueeze(-1).unsqueeze(-1)
-        return output.reshape(hidden_states.shape)
+        output = output.reshape(hidden_states.shape)
+        return hidden_states + output if add_residual else output
 
 
 class _DeepseekV41EngramLayerMixin:
